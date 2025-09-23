@@ -8,12 +8,11 @@ A comprehensive WhatsApp bot built with TypeScript that provides financial servi
 
 - **User Authentication**: Secure credential verification system
 - **State Management**: Persistent user session tracking
-- **Financial Services**: Balance checking, transfers, transaction history
+- **Financial Services**: Transfer funds and transaction history
 - **Smart Logging**: Winston-based logging with multiple levels
 - **Environment Configuration**: Flexible configuration via environment variables
 - **Rate Limiting**: Built-in protection against spam
 - **Feature Flags**: Enable/disable features dynamically
-- **Sticker Creation**: Convert images to WhatsApp stickers
 - **TypeScript**: Full type safety and modern ES modules
 
 ## 📋 Prerequisites
@@ -26,8 +25,8 @@ A comprehensive WhatsApp bot built with TypeScript that provides financial servi
 
 1. **Clone the repository**
    ```bash
-   git clone <repository-url>
-   cd ai-chatbot
+   git clone https://github.com/UGM-Cardano/TrustBridge-Chatbot.git
+   cd TrustBridge-Chatbot
    ```
 
 2. **Install dependencies**
@@ -46,9 +45,7 @@ A comprehensive WhatsApp bot built with TypeScript that provides financial servi
    LOG_LEVEL=info
    WHATSAPP_SESSION_NAME=trustbridge-session
    TRUSTBRIDGE_WEBSITE=https://trustbridge-finance.vercel.app/
-   ENABLE_STICKER_FEATURE=true
    ENABLE_TRANSFER_FEATURE=true
-   ENABLE_BALANCE_CHECK=true
    ```
 
 ## 🚀 Usage
@@ -88,9 +85,7 @@ npm run clean:sessions
 | `LOG_LEVEL` | Logging level (error, warn, info, debug) | `info` |
 | `WHATSAPP_SESSION_NAME` | WhatsApp session identifier | `trustbridge-session` |
 | `TRUSTBRIDGE_WEBSITE` | Main website URL | `https://trustbridge-finance.vercel.app/` |
-| `ENABLE_STICKER_FEATURE` | Enable sticker creation | `true` |
 | `ENABLE_TRANSFER_FEATURE` | Enable transfer functionality | `true` |
-| `ENABLE_BALANCE_CHECK` | Enable balance checking | `true` |
 | `MAX_MESSAGES_PER_MINUTE` | Rate limiting | `10` |
 | `MAX_LOGIN_ATTEMPTS` | Login attempt limit | `3` |
 
@@ -98,9 +93,7 @@ npm run clean:sessions
 
 Use environment variables to enable/disable features:
 
-- `ENABLE_STICKER_FEATURE=false` - Disables sticker creation
 - `ENABLE_TRANSFER_FEATURE=false` - Disables transfer functionality
-- `ENABLE_BALANCE_CHECK=false` - Disables balance checking
 
 ## 📱 Bot Commands
 
@@ -110,13 +103,9 @@ Use environment variables to enable/disable features:
 - `no` - New user registration
 
 ### Main Services (Authenticated Users)
-- `balance` - Check account balance
 - `transfer` - Initiate fund transfer
 - `history` - View transaction history
 - `settings` - Access account settings
-
-### Special Features
-- `!sticker` + image - Convert image to sticker
 
 ## 🗂 Project Structure
 
@@ -223,6 +212,3 @@ For support and questions:
 - Ensure all dependencies are installed
 - Contact the development team
 
----
-
-Built with ❤️ for TrustBridge Finance Platform
