@@ -3,6 +3,17 @@ import pkg from 'whatsapp-web.js';
 import type { Message } from 'whatsapp-web.js';
 import qrcode from 'qrcode-terminal';
 import logger from './logger.js';
+import { 
+  getExchangeRate, 
+  calculateRecipientAmount, 
+  getCurrentRates, 
+  testCMCConnection,
+  FALLBACK_RATES,
+  getCacheStats,
+  clearExchangeRateCache,
+  forceRefreshRates
+} from './exchangeRate.js';
+import { SUPPORTED_FIAT } from './fiatExchange.js';
 
 const { Client, LocalAuth } = pkg;
 
@@ -18,14 +29,30 @@ interface UserState {
     originalMessage: string;
   };
   transferFlow?: {
-    step: 'recipient_name' | 'recipient_currency' | 'recipient_bank' | 'recipient_account' | 'amount' | 'confirmation';
+    step: 
+      | 'payment_method'
+      | 'sender_currency'
+      | 'recipient_name'
+      | 'recipient_currency'
+      | 'recipient_bank'
+      | 'recipient_account'
+      | 'amount'
+      | 'card_number'
+      | 'card_cvc'
+      | 'card_expiry'
+      | 'confirmation';
     data: {
+      paymentMethod?: 'WALLET' | 'MASTERCARD';
       recipientName?: string;
       recipientCurrency?: string;
       recipientBank?: string;
       recipientAccount?: string;
-      senderCurrency?: string; // Always USD
+      senderCurrency?: string; 
       amount?: string;
+      // Card fields (only for MASTERCARD)
+      cardNumber?: string;
+      cardCvc?: string;
+      cardExpiry?: string;
     };
   };
 }
@@ -42,30 +69,6 @@ function getUserState(chatId: string): UserState {
   return userStates.get(chatId)!;
 }
 
-// Function to get exchange rate between currencies
-function getExchangeRate(fromCurrency: string, toCurrency: string): number {
-  // Mock exchange rates - in production this would call a real API
-  const rates: Record<string, Record<string, number>> = {
-    USD: { IDR: 15800 }, // 1 USD = 15,800 IDR (example rate)
-    IDR: { USD: 0.0000633 }, // 1 IDR = 0.0000633 USD
-    // Keep existing rates for backward compatibility if needed
-    SGD: { MYR: 3.5, IDR: 11500, THB: 26.5, PHP: 42.0, BND: 1.0 },
-    MYR: { SGD: 0.29, IDR: 3285, THB: 7.6, PHP: 12.0, BND: 0.29 },
-    THB: { SGD: 0.038, MYR: 0.13, IDR: 435, PHP: 1.58, BND: 0.038 },
-    PHP: { SGD: 0.024, MYR: 0.083, IDR: 277, THB: 0.63, BND: 0.024 },
-    BND: { SGD: 1.0, MYR: 3.5, IDR: 11500, THB: 26.5, PHP: 42.0 }
-  };
-
-  if (fromCurrency === toCurrency) return 1.0;
-  return rates[fromCurrency]?.[toCurrency] || 1.0;
-}
-
-// Function to calculate recipient amount
-function calculateRecipientAmount(senderAmount: number, fromCurrency: string, toCurrency: string): number {
-  const rate = getExchangeRate(fromCurrency, toCurrency);
-  return senderAmount * rate;
-}
-
 // Function to calculate transfer fees (mock implementation)
 function calculateTransferFee(amount: number): { fee: number; feePercentage: number } {
   // Mock fee structure - in production this would be based on real fee schedules
@@ -73,6 +76,9 @@ function calculateTransferFee(amount: number): { fee: number; feePercentage: num
   const fee = amount * feePercentage;
   return { fee, feePercentage };
 }
+
+// Supported fiat currencies are now imported from fiatExchange.ts
+// SUPPORTED_FIAT is imported at the top of this file
 
 
 
@@ -146,7 +152,7 @@ Please provide the recipient's bank name (e.g., BCA, Mandiri, BNI, etc.):
         // Go back to recipient account
         userState.transferFlow.step = 'recipient_account';
         delete data.recipientAccount; // Clear previous input
-        delete data.senderCurrency; // Clear auto-set USD
+        delete data.senderCurrency; // Clear auto-set USDT
         logger.info(`User ${chatId} went back to recipient_account step`);
         await message.reply(`🔢 Back to account number entry.
 
@@ -159,15 +165,28 @@ Please provide the recipient's account number:
         userState.transferFlow.step = 'amount';
         delete data.amount; // Clear previous input
         logger.info(`User ${chatId} went back to amount step`);
-        await message.reply(`💰 Back to amount entry.
+    await message.reply(`💰 Back to amount entry.
 
-How much USD would you like to transfer?
-💡 Type "back" to change account number`);
+  How much ${data.senderCurrency || 'USDT'} would you like to transfer?
+  💡 Type "back" to change account number`);
         return true;
     }
   }
 
   switch (step) {
+    case 'payment_method': {
+      const pm = userInput.toUpperCase();
+      if (pm !== 'WALLET' && pm !== 'MASTERCARD') {
+        await message.reply(`❌ Invalid payment method. Please type either "WALLET" or "MASTERCARD".`);
+        return true;
+      }
+      data.paymentMethod = pm as 'WALLET' | 'MASTERCARD';
+      logger.info(`User ${chatId} selected payment method: ${pm}`);
+      // Proceed to recipient name entry
+      userState.transferFlow!.step = 'recipient_name';
+      await message.reply(`👤 Please provide the recipient's full name:\n💡 Type "back" to cancel transfer`);
+      return true;
+    }
     case 'recipient_name':
       data.recipientName = userInput;
       userState.transferFlow.step = 'recipient_currency';
@@ -223,13 +242,17 @@ Please type "IDR":
         return true;
       }
       data.recipientAccount = userInput;
-      // Set sender currency to USDT by default
-      data.senderCurrency = 'USDT';
-      userState.transferFlow.step = 'amount';
-      logger.info(`User ${chatId} provided recipient account: ${userInput}`);
-      await message.reply(`💰 How much USDT would you like to transfer?
-
-💡 Type "back" to change account number`);
+      // If paying by card, ask which fiat currency they'll use (Mastercard supports fiat)
+      if (data.paymentMethod === 'MASTERCARD') {
+        userState.transferFlow.step = 'sender_currency';
+        logger.info(`User ${chatId} provided recipient account and will pay by card: ${userInput}`);
+        await message.reply(`🌍 Which currency will you pay with? Choose one of: ${SUPPORTED_FIAT.join(', ')}\n\nPlease type the 3-letter code (e.g. USD).`);
+      } else {
+        // Wallet: allow USDT or ADA
+        userState.transferFlow.step = 'sender_currency';
+        logger.info(`User ${chatId} provided recipient account and will pay from wallet: ${userInput}`);
+        await message.reply(`🌍 Which wallet currency will you pay with? Choose one of: USDT, ADA\n\nPlease type the code (e.g. USDT).`);
+      }
       return true;
 
     case 'amount': {
@@ -245,21 +268,30 @@ Please type "IDR":
       userState.transferFlow.step = 'confirmation';
       logger.info(`User ${chatId} provided amount: ${userInput}`);
       
-      // Calculate exchange rate and recipient amount
-      const senderAmount = parseFloat(userInput);
-      const exchangeRate = getExchangeRate(data.senderCurrency!, data.recipientCurrency!);
-      const recipientAmount = calculateRecipientAmount(senderAmount, data.senderCurrency!, data.recipientCurrency!);
-      const { fee, feePercentage } = calculateTransferFee(senderAmount);
-      const totalAmount = senderAmount + fee;
-      
-      // Format numbers for display
-      const formattedRate = exchangeRate.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 });
-      const formattedRecipientAmount = recipientAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedFee = fee.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      const formattedTotal = totalAmount.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-      
-      // Show confirmation with exchange rate
-      let confirmationMessage = `📋 Please confirm your transfer details:
+      try {
+        // Calculate exchange rate and recipient amount
+        const senderAmount = parseFloat(userInput);
+        const exchangeRate = await getExchangeRate(data.senderCurrency!, data.recipientCurrency!);
+        const recipientAmount = await calculateRecipientAmount(senderAmount, data.senderCurrency!, data.recipientCurrency!);
+        const { fee, feePercentage } = calculateTransferFee(senderAmount);
+        const totalAmount = senderAmount + fee;
+        
+  // Format numbers for display (Indonesian locale)
+  // Use 3 decimal places for both rate and recipient display to match example: "Rp 16.540,532"
+  const idrCurrency = new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', minimumFractionDigits: 3, maximumFractionDigits: 3 });
+  const idrRateFormatter = new Intl.NumberFormat('id-ID', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+
+  const formattedRate = idrRateFormatter.format(exchangeRate); // e.g. 16.540,532
+  // Use currency formatter for recipient amount (adds Rp symbol)
+  let formattedRecipientAmount = idrCurrency.format(recipientAmount); // e.g. Rp16.540,532
+  // Ensure a normal space after Rp for readability (Intl may return a non-breaking space)
+  formattedRecipientAmount = formattedRecipientAmount.replace(/^Rp\s?/, 'Rp ');
+
+  const formattedFee = `${fee.toFixed(2)} ${data.senderCurrency}`;
+  const formattedTotal = `${totalAmount.toFixed(2)} ${data.senderCurrency}`;
+        
+        // Show confirmation with exchange rate
+        let confirmationMessage = `📋 Please confirm your transfer details:
 
 👤 Recipient Name: ${data.recipientName}
 💱 Recipient Currency: ${data.recipientCurrency}
@@ -268,76 +300,153 @@ Please type "IDR":
 💱 Sender Currency: ${data.senderCurrency}
 💰 Amount: ${data.amount} ${data.senderCurrency}`;
 
-      // Add exchange rate info if currencies are different
-      if (data.senderCurrency !== data.recipientCurrency) {
-        confirmationMessage += `
+        // Add exchange rate info if currencies are different
+        if (data.senderCurrency !== data.recipientCurrency) {
+          confirmationMessage += `
 
 📊 Exchange Rate Information:
 💱 Rate: 1 ${data.senderCurrency} = ${formattedRate} ${data.recipientCurrency}
 💰 Recipient will receive: ${formattedRecipientAmount} ${data.recipientCurrency}`;
-      }
+        }
 
-      // Add fee information
-      confirmationMessage += `
+  // Add fee information
+  confirmationMessage += `
 
 💳 Fee Information:
-📊 Transfer Fee (${(feePercentage * 100).toFixed(1)}%): ${formattedFee} ${data.senderCurrency}
-💰 Total Amount: ${formattedTotal} ${data.senderCurrency}`;
+📊 Transfer Fee (${(feePercentage * 100).toFixed(1)}%): ${formattedFee}
+💰 Total Amount: ${formattedTotal}`;
 
-      confirmationMessage += `
+        confirmationMessage += `
 
 Type "confirm" to proceed, "cancel" to abort, or "back" to change amount.`;
 
-      await message.reply(confirmationMessage);
+        await message.reply(confirmationMessage);
+        return true;
+      } catch (error) {
+        logger.error('Error calculating exchange rate:', error);
+        await message.reply('❌ Sorry, there was an error calculating the exchange rate. Please try again or contact support.');
+        delete userState.transferFlow;
+        return true;
+      }
+    }
+
+    case 'card_number': {
+      const digits = userInput.replace(/\s+/g, '');
+      if (!/^\d{13,19}$/.test(digits)) {
+        await message.reply(`❌ Invalid card number. Please enter digits only (13-19 digits).`);
+        return true;
+      }
+      data.cardNumber = digits;
+      userState.transferFlow.step = 'card_cvc';
+      await message.reply(`🔒 Enter CVC (3 or 4 digits):`);
+      return true;
+    }
+
+    case 'card_cvc': {
+      if (!/^\d{3,4}$/.test(userInput)) {
+        await message.reply(`❌ Invalid CVC. Please enter 3 or 4 digits.`);
+        return true;
+      }
+      data.cardCvc = userInput;
+      userState.transferFlow.step = 'card_expiry';
+      await message.reply(`📅 Enter card expiry (MM/YY or MM/YYYY):`);
+      return true;
+    }
+
+    case 'card_expiry': {
+      if (!/^(0[1-9]|1[0-2])\/(\d{2}|\d{4})$/.test(userInput)) {
+        await message.reply(`❌ Invalid expiry format. Use MM/YY or MM/YYYY.`);
+        return true;
+      }
+      data.cardExpiry = userInput;
+      // After collecting card, ask for amount
+      userState.transferFlow.step = 'amount';
+  await message.reply(`💰 Card saved. How much ${data.senderCurrency || 'USDT'} would you like to transfer?
+
+💡 Type "back" to change account number`);
+      return true;
+    }
+
+    case 'sender_currency': {
+      const code = userInput.toUpperCase();
+      // Validation differs for MASTERCARD (fiat list) vs WALLET (USDT/ADA)
+      if (data.paymentMethod === 'MASTERCARD') {
+        if (!SUPPORTED_FIAT.includes(code)) {
+          await message.reply(`❌ Unsupported currency. Please choose one of: ${SUPPORTED_FIAT.join(', ')}`);
+          return true;
+        }
+      } else {
+        if (!(code === 'USDT' || code === 'ADA')) {
+          await message.reply(`❌ Unsupported wallet currency. Please choose one of: USDT, ADA`);
+          return true;
+        }
+      }
+
+      data.senderCurrency = code;
+      // After choosing fiat for Mastercard, collect card details
+      if (data.paymentMethod === 'MASTERCARD') {
+        userState.transferFlow.step = 'card_number';
+        await message.reply(`💳 You chose to pay with ${code}. Please enter your card number (no spaces):`);
+        return true;
+      }
+      // WALLET: proceed to amount entry
+      userState.transferFlow.step = 'amount';
+      await message.reply(`💰 How much ${code} would you like to transfer?`);
       return true;
     }
 
     case 'confirmation':
       if (userInput.toLowerCase() === 'confirm') {
         logger.info(`User ${chatId} confirmed transfer: ${JSON.stringify(data)}`);
-        
+
         // Clear transfer flow
         delete userState.transferFlow;
-        
-        await message.reply(`✅ Transfer request submitted successfully!
 
-Your funds will be sent shortly.
-Transaction ID: TB${Date.now()}
+        try {
+          const backend = await import('./services/backendService.js');
 
-📧 You will receive a confirmation email shortly.
-💬 Type "history" to view your transaction history.`);
+          // Build request without assigning undefined fields (to satisfy strict optional types)
+          const createReq: import('./types/index.js').CreateTransactionRequest = {
+            recipientPhone: chatId.startsWith('+') ? chatId : `+${chatId.replace('@c.us','')}`,
+            sourceCurrency: data.senderCurrency!,
+            targetCurrency: data.recipientCurrency!,
+            sourceAmount: parseFloat(data.amount!)
+          };
+
+          if (data.recipientAccount) createReq.recipientBankAccount = data.recipientAccount;
+          if (data.recipientName) createReq.recipientName = data.recipientName;
+          // Attach payment method and card data when paying by Mastercard
+          if (data.paymentMethod === 'MASTERCARD') {
+            createReq.paymentMethod = 'MASTERCARD';
+            createReq.card = {
+              number: data.cardNumber || '',
+              cvc: data.cardCvc || '',
+              expiry: data.cardExpiry || ''
+            };
+          } else {
+            createReq.paymentMethod = 'WALLET';
+          }
+
+          const tx = await backend.BackendService.createTransaction(chatId, createReq);
+
+          await message.reply(`✅ Transfer request submitted successfully!\n\nTransaction ID: ${tx.id}\nStatus: ${tx.status}\nPayment link: ${tx.paymentLink || 'N/A'}\n\nYou will receive updates when the status changes.`);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          logger.error('[Transfer] Create transaction error:', msg);
+          await message.reply(`❌ Failed to create transaction: ${msg || 'Unknown error'}. Please try again later.`);
+        }
+
         return true;
-        
       } else if (userInput.toLowerCase() === 'cancel') {
         logger.info(`User ${chatId} cancelled transfer`);
         delete userState.transferFlow;
-        await message.reply(`❌ Transfer cancelled. How else can I help you today?
-
-📋 Available services:
-• Type "transfer" - Start a new transfer
-• Type "history" - View transaction history
-• Type "help" - List available commands`);
+        await message.reply(`❌ Transfer cancelled. How else can I help you today?\n\n📋 Available services:\n• Type "transfer" - Start a new transfer\n• Type "history" - View transaction history\n• Type "help" - List available commands`);
         return true;
-        
-      } else {
-        await message.reply('Please type "confirm" to proceed, "cancel" to abort, or "back" to change amount.');
-        return true;
-      }
+  }
+  return true;
   }
 
-  return false;
 }
-
-client.on('qr', (qr) => {
-    qrcode.generate(qr, {small: true});
-    logger.info('QR Code generated for WhatsApp Web authentication');
-    console.log('QR RECEIVED', qr);
-});
-
-client.on('ready', () => {
-    logger.info('WhatsApp bot is ready and connected!');
-    console.log('Client is ready!');
-});
 
 client.on('message', async (message) => {
     logger.info(`Received message from ${message.from}: ${message.body}`);
@@ -373,8 +482,8 @@ Your trusted partner to send money across different countries faster using block
 🚀 Ready to transfer money? Simply type "transfer" to get started!
 
 📋 Available commands:
-• Type "transfer" - Start money transfer
-• Type "history" - View transaction history
+• Type "transfer"
+• Type "rates" - View current USDT exchange rates  
 • Type "help" - Get help and support`);
       return;
     }
@@ -392,16 +501,19 @@ Would you like to:
         return;
       }
       
-      // Initialize transfer flow
+      // Initialize transfer flow - ask for payment method first
       userState.transferFlow = {
-        step: 'recipient_name',
+        step: 'payment_method',
         data: {}
       };
-      
+
       logger.info(`User ${chatId} started transfer flow`);
       await message.reply(`💸 Let's start your transfer process!
 
-👤 First, please provide the recipient's full name:
+How would you like to pay?
+• Type "WALLET" - Pay via Wallet (redirect to payment link)
+• Type "MASTERCARD" - Pay via Mastercard (enter card details here)
+
 💡 Type "back" to cancel transfer`);
       return;
     }
@@ -411,21 +523,23 @@ Would you like to:
       await message.reply(`🆘 TrustBridge Help & Support
 
 📋 Available commands:
-• Type "transfer" - Start money transfer process
-• Type "history" - View your transaction history
+• Type "transfer" - Start USDT→IDR transfer process
+• Type "rates" - View current USDT exchange rates
+• Type "refresh" - Force refresh exchange rates
+• Type "test" - Test CoinMarketCap API
 • Type "hi" or "hello" - Get welcome message
 
 💸 Transfer Process:
 1. Recipient name
-2. Currency selection (USD/IDR) 
-3. Bank information
+2. Currency selection (only IDR supported)
+3. Bank information  
 4. Account number
-5. Transfer amount
+5. Transfer amount (in USDT)
 6. Confirmation
 
 🌐 Supported:
-• From: USD (US Dollar)
-• To: IDR (Indonesian Rupiah) or USD
+• From: USDT (Tether)
+• To: IDR (Indonesian Rupiah)
 
 📞 Need more help? Contact our support team!`);
       return;
@@ -456,14 +570,154 @@ Would you like to:
       }
     }
     
+    // Handle debug command
+    if (userInput === 'debug') {
+      await message.reply(`🔧 Debug Information:
+
+📊 Cache Stats:
+${JSON.stringify(getCacheStats(), null, 2)}
+
+🔧 Test Commands:
+• "test" - Test CoinMarketCap API
+• "clear" - Clear exchange rate cache
+• "rates" - Show current rates
+• "refresh" - Force refresh rates
+
+💬 Available Commands:
+• "transfer" - Start money transfer
+• "help" - Show help menu`);
+      return;
+    }
+
+    // Handle test command
+    if (userInput === 'test') {
+      await message.reply('🔍 Testing CoinMarketCap API connection...');
+      
+      try {
+        const connectionTest = await testCMCConnection();
+        
+        if (!connectionTest.success) {
+          await message.reply(`❌ CoinMarketCap API Test Failed:
+
+🔑 Status: ${connectionTest.message}
+
+💡 If API key is missing:
+1. Check .env file has CMC_API_KEY
+2. Get free API key from coinmarketcap.com/api
+3. Restart the bot after adding key`);
+          return;
+        }
+        
+        // Test actual exchange rates
+        const rates = await getCurrentRates();
+        
+        await message.reply(`✅ Exchange Rate API Test Results:
+
+🔑 API Status: ${connectionTest.success ? 'Working ✅' : 'Failed ❌'}
+💰 USDT → IDR: ${rates.usdtToIdr.toLocaleString('id-ID')}
+📊 Data Source: ${rates.source === 'api' ? 'CoinMarketCap API' : 'Fallback Rates'}
+
+⏰ Last Updated: ${rates.timestamp}
+🔄 Cache Status: ${getCacheStats().size} rates cached`);
+        
+      } catch (error) {
+        logger.error(`Exchange rate test failed for user ${chatId}:`, error);
+        const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+        await message.reply(`❌ Exchange Rate Test Failed:
+
+📝 Error: ${errorMessage}
+
+🔄 Will use fallback rates for transfers.
+Contact support if this persists.`);
+      }
+      return;
+    }
+    
+    // Handle rates command
+    if (userInput === 'rates') {
+      await message.reply('📊 Fetching current exchange rates...');
+      
+      try {
+        const rates = await getCurrentRates();
+        
+        const statusIcon = rates.source === 'api' ? '🟢' : '🟡';
+        const sourceText = rates.source === 'api' ? 'Live from APIs' : 'Using Fallback Rates';
+        const cacheStatus = rates.cached ? `🔄 Cached (${rates.cacheAge})` : '🆕 Fresh from API';
+        
+        await message.reply(`💹 Current Exchange Rates
+
+🪙 USDT → IDR
+Rate: Rp ${rates.usdtToIdr.toLocaleString('id-ID')}
+
+${statusIcon} Status: ${sourceText}
+${cacheStatus}
+⏰ Updated: ${rates.timestamp}
+
+💡 Commands:
+• "refresh" - Force fresh rates
+• "transfer" - Start money transfer`);
+        
+      } catch (error) {
+        logger.error(`Failed to fetch rates for user ${chatId}:`, error);
+        await message.reply(`❌ Unable to fetch current rates
+
+Using fallback rates:
+🪙 USDT → IDR: Rp ${(FALLBACK_RATES.USDT?.IDR || 16740).toLocaleString('id-ID')}
+
+💡 Ready to transfer? Type "transfer"`);
+      }
+      return;
+    }
+    
+    // Handle refresh command
+    if (userInput === 'refresh') {
+      await message.reply('🔄 Force refreshing exchange rates...');
+      
+      try {
+        const refreshResult = await forceRefreshRates();
+        
+        if (refreshResult.success && refreshResult.rates) {
+          await message.reply(`✅ Exchange Rates Refreshed!
+
+🆕 Fresh from APIs:
+🪙 USDT → IDR: Rp ${refreshResult.rates.usdtToIdr.toLocaleString('id-ID')}
+
+⏰ Updated: ${new Date().toLocaleString('id-ID')}
+🔄 Cache cleared - next requests will be live
+
+💡 Type "rates" to see updated rates`);
+        } else {
+          await message.reply(`❌ Failed to refresh rates: ${refreshResult.message}
+
+🔄 Try again later or use "rates" for current rates`);
+        }
+        
+      } catch (error) {
+        logger.error(`Failed to refresh rates for user ${chatId}:`, error);
+        await message.reply('❌ Failed to refresh rates. Please try again.');
+      }
+      return;
+    }
+    
+    // Handle clear cache command
+    if (userInput === 'clear') {
+      clearExchangeRateCache();
+      await message.reply(`🗑️ Exchange rate cache cleared!
+
+Next rate requests will fetch fresh data from APIs.
+💡 Type "rates" to fetch new rates`);
+      return;
+    }
+    
     // Default response for unknown commands
     await message.reply(`🤔 I didn't understand that command.
 
-� To get started:
-• Type "transfer" - Start money transfer
-• Type "history" - View transaction history
-• Type "help" - Get help and available commands
-• Type "hi" - Get welcome message`);
+💡 Here are some things you can try:
+• "transfer" - Start a money transfer
+• "rates" - Check current exchange rates  
+• "help" - See all available commands
+
+Need assistance? Type "help" for the full command list.`);
 });
 
 // Add error handling
@@ -478,3 +732,12 @@ client.on('auth_failure', (message) => {
 // Initialize client
 logger.info('Initializing WhatsApp bot...');
 client.initialize();
+
+// Show QR in terminal when needed
+client.on('qr', (qr: string) => {
+  try {
+    qrcode.generate(qr, { small: true });
+  } catch (e) {
+    logger.debug('QR generation failed:', e);
+  }
+});
