@@ -478,14 +478,27 @@ client.on('message', async (message) => {
     logger.info(`Received message from ${message.from}: ${message.body}`);
     console.log(message.body);
     const chatId = message.from;
+
+    // Ignore group messages and broadcasts - only handle private chats
+    if (chatId.includes('@g.us') || chatId.includes('@broadcast')) {
+      logger.info(`Ignoring message from group/broadcast: ${chatId}`);
+      return;
+    }
+
+    // Ignore empty messages
+    if (!message.body || message.body.trim() === '') {
+      logger.info(`Ignoring empty message from ${chatId}`);
+      return;
+    }
+
     const userState = getUserState(chatId);
-    
+
     // Handle transfer flow if active
     if (userState.transferFlow) {
       const handled = await handleTransferFlow(message, userState, chatId);
       if (handled) return;
     }
-    
+
     const userInput = message.body.trim().toLowerCase();
     
     // Handle initial greeting

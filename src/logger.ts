@@ -32,6 +32,20 @@ const logger = winston.createLogger({
   ],
 });
 
+// Safe JSON stringify that handles circular references
+function safeStringify(obj: any, indent = 2): string {
+  const seen = new WeakSet();
+  return JSON.stringify(obj, (key, value) => {
+    if (typeof value === 'object' && value !== null) {
+      if (seen.has(value)) {
+        return '[Circular]';
+      }
+      seen.add(value);
+    }
+    return value;
+  }, indent);
+}
+
 // Add console transport for development
 if (process.env.NODE_ENV !== 'production') {
   logger.add(new winston.transports.Console({
@@ -39,7 +53,8 @@ if (process.env.NODE_ENV !== 'production') {
       winston.format.colorize(),
       winston.format.simple(),
       winston.format.printf(({ timestamp, level, message, service, ...meta }) => {
-        return `${timestamp} [${service}] ${level}: ${message} ${Object.keys(meta).length ? JSON.stringify(meta, null, 2) : ''}`;
+        const metaStr = Object.keys(meta).length ? safeStringify(meta, 2) : '';
+        return `${timestamp} [${service}] ${level}: ${message} ${metaStr}`;
       })
     )
   }));

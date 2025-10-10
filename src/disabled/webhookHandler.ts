@@ -28,7 +28,7 @@ try {
   // leave stubs in place
   // logger isn't imported at top of file for this try/catch block safety
 }
-import type { WebhookPayload } from '../types.js';
+import type { WebhookPayload } from '../types/index.js';
 
 export function createWebhookRouter(whatsappClient: Client) {
   const router = express.Router();

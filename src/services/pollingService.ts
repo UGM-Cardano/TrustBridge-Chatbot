@@ -143,6 +143,117 @@ export class PollingService {
   }
 
   /**
+   * Create detailed completion summary message
+   */
+  private static async createCompletionSummary(details: any): Promise<string> {
+    try {
+      const sender = details.sender || {};
+      const recipient = details.recipient || {};
+      const fees = details.fees || {};
+      const blockchain = details.blockchain || {};
+
+      // Format amounts
+      const senderAmount = sender.amount || 0;
+      const recipientAmount = recipient.amount || 0;
+      const feeAmount = fees.amount || 0;
+      const totalCharged = sender.totalCharged || (senderAmount + feeAmount);
+
+      // Format currencies with symbols
+      const senderCurrencyDisplay = this.formatCurrency(senderAmount, sender.currency);
+      const recipientCurrencyDisplay = this.formatCurrency(recipientAmount, recipient.currency);
+      const feeDisplay = this.formatCurrency(feeAmount, sender.currency);
+      const totalDisplay = this.formatCurrency(totalCharged, sender.currency);
+
+      let message = `✅ *Transfer Completed Successfully!*\n\n`;
+      message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      // Transfer Summary
+      message += `📤 *You Sent*\n`;
+      message += `   ${senderCurrencyDisplay}\n\n`;
+
+      message += `📥 *Recipient Receives*\n`;
+      message += `   ${recipientCurrencyDisplay}\n`;
+      message += `   ${recipient.name || 'N/A'}\n`;
+      message += `   ${recipient.bank || 'N/A'} - ${recipient.account || 'N/A'}\n\n`;
+
+      message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      // Transaction Details
+      message += `💳 *Transaction Details*\n`;
+      message += `   Fee: ${feeDisplay} (${fees.percentage || 0}%)\n`;
+      message += `   Total: ${totalDisplay}\n`;
+      message += `   Rate: ${this.formatExchangeRate(sender.currency, recipient.currency, recipientAmount / senderAmount)}\n\n`;
+
+      // Blockchain Info (optional, hidden by default)
+      if (blockchain.mockADAAmount) {
+        message += `⛓️ *Blockchain*\n`;
+        message += `   Via mockADA Hub\n`;
+        message += `   ${blockchain.mockADAAmount.toFixed(2)} mockADA used\n\n`;
+      }
+
+      message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+
+      message += `✨ *Your money is on the way!*\n`;
+      message += `The recipient will receive the funds in their bank account shortly.\n\n`;
+
+      message += `Thank you for using TrustBridge! 🌉`;
+
+      return message;
+    } catch (error) {
+      logger.error('Error creating completion summary:', error);
+      // Return fallback message
+      return `✅ *Transfer Completed!*\n\nYour transfer has been completed successfully!\n\nThank you for using TrustBridge! 🌉`;
+    }
+  }
+
+  /**
+   * Format currency with symbol
+   */
+  private static formatCurrency(amount: number, currency: string): string {
+    const symbols: Record<string, string> = {
+      'USD': '$',
+      'EUR': '€',
+      'GBP': '£',
+      'JPY': '¥',
+      'CNY': '¥',
+      'IDR': 'Rp',
+      'PHP': '₱',
+      'THB': '฿',
+      'MYR': 'RM',
+      'SGD': 'S$',
+      'INR': '₹',
+      'VND': '₫',
+      'AED': 'د.إ',
+      'MXN': '$',
+    };
+
+    const symbol = symbols[currency] || currency;
+    const formatted = amount.toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2
+    });
+
+    // For currencies that use symbol-first format
+    if (['USD', 'EUR', 'GBP', 'SGD', 'MXN'].includes(currency)) {
+      return `${symbol}${formatted}`;
+    }
+
+    // For currencies that use symbol-last format
+    return `${symbol} ${formatted}`;
+  }
+
+  /**
+   * Format exchange rate
+   */
+  private static formatExchangeRate(from: string, to: string, rate: number): string {
+    const formatted = rate.toLocaleString('en-US', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 4
+    });
+    return `1 ${from} = ${formatted} ${to}`;
+  }
+
+  /**
    * Send status update to user
    */
   private static async sendStatusUpdate(
@@ -155,41 +266,53 @@ export class PollingService {
     }
 
     try {
-      let message = `🔔 Transaction Update\n\nTransaction ID: ${task.transferId}\n`;
+      let message = '';
 
       switch (status.status.toUpperCase()) {
         case 'PAID':
+          message = `🔔 *Transaction Update*\n\n`;
+          message += `Transaction ID: ${task.transferId}\n`;
           message += `Status: ✅ Payment Confirmed\n\n`;
           message += `Your payment has been received and is being processed. You'll receive another update when the transaction is completed.`;
           break;
 
         case 'PROCESSING':
+          message = `🔔 *Transaction Update*\n\n`;
+          message += `Transaction ID: ${task.transferId}\n`;
           message += `Status: ⏳ Processing\n\n`;
-          message += `Your transaction is being processed on the blockchain. This may take a few minutes.`;
+          message += `Your transaction is being processed on the blockchain. This may take a few moments.`;
           break;
 
         case 'COMPLETED':
-          message += `Status: ✅ Completed\n\n`;
-          message += `Your transfer has been completed successfully!`;
-
-          if (status.blockchainTx) {
-            message += `\n\n🔗 Blockchain Transaction:\n${status.blockchainTx}`;
+          // Fetch full transfer details for summary
+          try {
+            const details = await BackendService.getTransactionDetails(task.transferId);
+            message = await this.createCompletionSummary(details);
+          } catch (error) {
+            // Fallback to simple message if details fetch fails
+            logger.error('Failed to fetch transfer details:', error);
+            message = `✅ *Transfer Completed!*\n\n`;
+            message += `Transaction ID: ${task.transferId}\n\n`;
+            message += `Your transfer has been completed successfully!\n\n`;
+            message += `Thank you for using TrustBridge! 🌉`;
           }
-
-          message += `\n\nThank you for using TrustBridge! 🌉`;
           break;
 
         case 'FAILED':
-          message += `Status: ❌ Failed\n\n`;
+          message = `❌ *Transaction Failed*\n\n`;
+          message += `Transaction ID: ${task.transferId}\n\n`;
           message += `Unfortunately, your transaction failed. Please contact support or try again.`;
           break;
 
         case 'CANCELLED':
-          message += `Status: ⚠️ Cancelled\n\n`;
+          message = `⚠️ *Transaction Cancelled*\n\n`;
+          message += `Transaction ID: ${task.transferId}\n\n`;
           message += `Your transaction has been cancelled.`;
           break;
 
         default:
+          message = `🔔 *Transaction Update*\n\n`;
+          message += `Transaction ID: ${task.transferId}\n`;
           message += `Status: ${status.status}\n\n`;
           message += `We'll notify you when there are more updates.`;
       }

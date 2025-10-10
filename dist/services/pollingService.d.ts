@@ -36,6 +36,18 @@ export declare class PollingService {
      */
     private static isTerminalStatus;
     /**
+     * Create detailed completion summary message
+     */
+    private static createCompletionSummary;
+    /**
+     * Format currency with symbol
+     */
+    private static formatCurrency;
+    /**
+     * Format exchange rate
+     */
+    private static formatExchangeRate;
+    /**
      * Send status update to user
      */
     private static sendStatusUpdate;
