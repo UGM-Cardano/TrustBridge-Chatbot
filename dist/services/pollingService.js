@@ -1,7 +1,10 @@
 import pkg from 'whatsapp-web.js';
 import logger from '../logger.js';
 import { BackendService } from './backendService.js';
-const { Client } = pkg;
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
+const { Client, MessageMedia } = pkg;
 export class PollingService {
     static client = null;
     static activeTasks = new Map();
@@ -149,9 +152,14 @@ export class PollingService {
             message += `   Rate: ${this.formatExchangeRate(sender.currency, recipient.currency, recipientAmount / senderAmount)}\n\n`;
             // Blockchain Info (optional, hidden by default)
             if (blockchain.mockADAAmount) {
-                message += `⛓️ *Blockchain*\n`;
-                message += `   Via mockADA Hub\n`;
-                message += `   ${blockchain.mockADAAmount.toFixed(2)} mockADA used\n\n`;
+                const adaAmount = typeof blockchain.mockADAAmount === 'number'
+                    ? blockchain.mockADAAmount
+                    : parseFloat(blockchain.mockADAAmount);
+                if (!isNaN(adaAmount)) {
+                    message += `⛓️ *Blockchain*\n`;
+                    message += `   Via mockADA Hub\n`;
+                    message += `   ${adaAmount.toFixed(2)} mockADA used\n\n`;
+                }
             }
             message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
             message += `✨ *Your money is on the way!*\n`;
@@ -235,6 +243,12 @@ export class PollingService {
                     try {
                         const details = await BackendService.getTransactionDetails(task.transferId);
                         message = await this.createCompletionSummary(details);
+                        // Send completion message first
+                        await this.client.sendMessage(task.chatId, message);
+                        // Download and send invoice PDF
+                        await this.sendInvoicePDF(task);
+                        // Return early since we already sent the message
+                        return;
                     }
                     catch (error) {
                         // Fallback to simple message if details fetch fails
@@ -305,6 +319,54 @@ export class PollingService {
         }
         catch (error) {
             logger.error(`Failed to send error message:`, error);
+        }
+    }
+    /**
+     * Download and send invoice PDF to user
+     */
+    static async sendInvoicePDF(task) {
+        if (!this.client) {
+            logger.error('WhatsApp client not initialized');
+            return;
+        }
+        try {
+            logger.info(`Downloading invoice PDF for transfer ${task.transferId}`);
+            // Get backend URL from environment
+            const backendUrl = process.env.BACKEND_API_URL || 'http://localhost:5000';
+            const invoiceUrl = `${backendUrl}/api/transfer/invoice/${task.transferId}`;
+            // Fetch PDF from backend
+            const response = await fetch(invoiceUrl);
+            if (!response.ok) {
+                throw new Error(`Failed to download invoice: ${response.status} ${response.statusText}`);
+            }
+            // Get PDF buffer
+            const arrayBuffer = await response.arrayBuffer();
+            const buffer = Buffer.from(arrayBuffer);
+            // Save to temp file
+            const tempDir = os.tmpdir();
+            const tempFilePath = path.join(tempDir, `TrustBridge-Invoice-${task.transferId}.pdf`);
+            fs.writeFileSync(tempFilePath, buffer);
+            logger.info(`Invoice PDF saved to ${tempFilePath}`);
+            // Create MessageMedia from file
+            const media = MessageMedia.fromFilePath(tempFilePath);
+            // Send PDF to user
+            await this.client.sendMessage(task.chatId, media, {
+                caption: `📄 *Invoice for Transaction ${task.transferId}*\n\nHere's your transaction invoice. Thank you for using TrustBridge! 🌉`
+            });
+            logger.info(`Invoice PDF sent to ${task.chatId} for transfer ${task.transferId}`);
+            // Clean up temp file
+            fs.unlinkSync(tempFilePath);
+            logger.info(`Cleaned up temp file ${tempFilePath}`);
+        }
+        catch (error) {
+            logger.error(`Failed to send invoice PDF for transfer ${task.transferId}:`, error);
+            // Send error message to user
+            try {
+                await this.client.sendMessage(task.chatId, `⚠️ Unable to send invoice PDF automatically. You can download it from the dashboard or contact support.`);
+            }
+            catch (msgError) {
+                logger.error(`Failed to send error message:`, msgError);
+            }
         }
     }
     /**

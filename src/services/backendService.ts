@@ -130,8 +130,8 @@ export class BackendService {
         senderAmount: request.sourceAmount,
         recipientName: request.recipientName,
         recipientCurrency: request.targetCurrency,
-        recipientBank: request.recipientBankAccount, // Assuming bank name is in this field
-        recipientAccount: request.recipientBankAccount,
+        recipientBank: request.recipientBank, // Bank name (e.g., BNI, BCA)
+        recipientAccount: request.recipientBankAccount, // Account number
         cardDetails: request.card,
       };
 
@@ -207,6 +207,32 @@ export class BackendService {
       throw new Error('Invalid response from details endpoint');
     } catch (error) {
       this.handleError('Failed to get transaction details', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get transaction history for authenticated user
+   */
+  static async getTransactionHistory(whatsappNumber: string, limit: number = 10): Promise<any[]> {
+    try {
+      logger.info(`Fetching transaction history for ${whatsappNumber}`);
+
+      // Ensure user is authenticated
+      await this.ensureAuthenticated(whatsappNumber);
+      const authHeaders = await this.getAuthHeader(whatsappNumber);
+
+      const response = await this.apiClient.get(`/api/transactions/history?limit=${limit}`, {
+        headers: authHeaders,
+      });
+
+      if (response.data && response.data.success) {
+        return response.data.transactions || [];
+      }
+
+      throw new Error('Invalid response from history endpoint');
+    } catch (error) {
+      this.handleError('Failed to get transaction history', error);
       throw error;
     }
   }

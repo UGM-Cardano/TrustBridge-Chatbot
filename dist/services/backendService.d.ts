@@ -46,6 +46,10 @@ export declare class BackendService {
      */
     static getTransactionDetails(transferId: string): Promise<any>;
     /**
+     * Get transaction history for authenticated user
+     */
+    static getTransactionHistory(whatsappNumber: string, limit?: number): Promise<any[]>;
+    /**
      * Handle API errors with proper logging
      */
     private static handleError;

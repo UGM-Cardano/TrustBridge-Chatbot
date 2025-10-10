@@ -18,6 +18,9 @@ import { BackendService } from './services/backendService.js';
 import { AuthService } from './services/authService.js';
 import { PollingService } from './services/pollingService.js';
 
+// Supported mock tokens for WALLET payment
+const SUPPORTED_MOCK_TOKENS = ['mockADA', 'mockUSDC', 'mockIDRX', 'mockEUROC', 'mockJPYC', 'mockCNHT', 'mockMXNT'];
+
 const { Client, LocalAuth } = pkg;
 
 const client = new Client({
@@ -185,7 +188,8 @@ Please provide the recipient's account number:
       }
       data.paymentMethod = pm as 'WALLET' | 'MASTERCARD';
       logger.info(`User ${chatId} selected payment method: ${pm}`);
-      // Proceed to recipient name entry
+
+      // Both WALLET and MASTERCARD continue with form flow
       userState.transferFlow!.step = 'recipient_name';
       await message.reply(`👤 Please provide the recipient's full name:\n💡 Type "back" to cancel transfer`);
       return true;
@@ -251,10 +255,10 @@ Please type "IDR":
         logger.info(`User ${chatId} provided recipient account and will pay by card: ${userInput}`);
         await message.reply(`🌍 Which currency will you pay with? Choose one of: ${SUPPORTED_FIAT.join(', ')}\n\nPlease type the 3-letter code (e.g. USD).`);
       } else {
-        // Wallet: allow USDT or ADA
+        // Wallet: allow mock tokens
         userState.transferFlow.step = 'sender_currency';
         logger.info(`User ${chatId} provided recipient account and will pay from wallet: ${userInput}`);
-        await message.reply(`🌍 Which wallet currency will you pay with? Choose one of: USDT, ADA\n\nPlease type the code (e.g. USDT).`);
+        await message.reply(`🪙 Which mock token will you send?\n\nAvailable tokens:\n${SUPPORTED_MOCK_TOKENS.map(t => `• ${t}`).join('\n')}\n\nPlease type the token name (e.g. mockADA):`);
       }
       return true;
 
@@ -371,21 +375,24 @@ Type "confirm" to proceed, "cancel" to abort, or "back" to change amount.`;
     }
 
     case 'sender_currency': {
-      const code = userInput.toUpperCase();
-      // Validation differs for MASTERCARD (fiat list) vs WALLET (USDT/ADA)
+      const code = userInput;
+      // Validation differs for MASTERCARD (fiat list) vs WALLET (mock tokens)
       if (data.paymentMethod === 'MASTERCARD') {
-        if (!SUPPORTED_FIAT.includes(code)) {
+        const upperCode = code.toUpperCase();
+        if (!SUPPORTED_FIAT.includes(upperCode)) {
           await message.reply(`❌ Unsupported currency. Please choose one of: ${SUPPORTED_FIAT.join(', ')}`);
           return true;
         }
+        data.senderCurrency = upperCode;
       } else {
-        if (!(code === 'USDT' || code === 'ADA')) {
-          await message.reply(`❌ Unsupported wallet currency. Please choose one of: USDT, ADA`);
+        // WALLET: validate mock token
+        if (!SUPPORTED_MOCK_TOKENS.includes(code)) {
+          await message.reply(`❌ Unsupported token. Please choose one of:\n${SUPPORTED_MOCK_TOKENS.map(t => `• ${t}`).join('\n')}`);
           return true;
         }
+        data.senderCurrency = code;
       }
 
-      data.senderCurrency = code;
       // After choosing fiat for Mastercard, collect card details
       if (data.paymentMethod === 'MASTERCARD') {
         userState.transferFlow.step = 'card_number';
@@ -422,6 +429,7 @@ Type "confirm" to proceed, "cancel" to abort, or "back" to change amount.`;
           };
 
           if (data.recipientAccount) createReq.recipientBankAccount = data.recipientAccount;
+          if (data.recipientBank) createReq.recipientBank = data.recipientBank;
           if (data.recipientName) createReq.recipientName = data.recipientName;
 
           // Attach payment method and card data
@@ -436,25 +444,61 @@ Type "confirm" to proceed, "cancel" to abort, or "back" to change amount.`;
             createReq.paymentMethod = 'WALLET';
           }
 
-          await message.reply('💳 Creating transaction...');
-          const tx = await BackendService.createTransaction(whatsappNumber, createReq);
+          // For WALLET: Create transfer record and send payment link
+          if (data.paymentMethod === 'WALLET') {
+            await message.reply('💳 Creating transfer record...');
+            const tx = await BackendService.createTransaction(whatsappNumber, createReq);
 
-          let responseMessage = `✅ Transfer request submitted successfully!\n\n`;
-          responseMessage += `Transaction ID: ${tx.id}\n`;
-          responseMessage += `Status: ${tx.status}\n`;
+            // Generate payment link with pre-filled data
+            const frontendUrl = process.env.FRONTEND_URL || 'http://localhost:3000';
+            const params = new URLSearchParams({
+              transferId: tx.id,
+              recipientName: data.recipientName || '',
+              recipientCurrency: data.recipientCurrency || '',
+              recipientBank: data.recipientBank || '',
+              recipientAccount: data.recipientAccount || '',
+              senderCurrency: data.senderCurrency || '',
+              amount: data.amount || ''
+            });
+            const paymentLink = `${frontendUrl}/wallet-transfer?${params.toString()}`;
 
-          if (tx.paymentLink) {
-            responseMessage += `\n💳 Payment Link:\n${tx.paymentLink}\n`;
-            responseMessage += `\nPlease complete your payment using the link above.`;
+            let responseMessage = `✅ Transfer details confirmed!\n\n`;
+            responseMessage += `Transaction ID: ${tx.id}\n`;
+            responseMessage += `Status: ${tx.status}\n\n`;
+            responseMessage += `🔗 *Payment Link:*\n${paymentLink}\n\n`;
+            responseMessage += `📱 *Next Steps:*\n`;
+            responseMessage += `1. Click the link above\n`;
+            responseMessage += `2. Connect your Cardano wallet\n`;
+            responseMessage += `3. Review the pre-filled details\n`;
+            responseMessage += `4. Send ${data.amount} ${data.senderCurrency} from your wallet\n\n`;
+            responseMessage += `🔔 You will receive automatic updates when the transaction is complete.`;
+
+            await message.reply(responseMessage);
+
+            // Start polling for transaction status updates
+            PollingService.startPolling(tx.id, chatId);
+            logger.info(`Started polling for WALLET transaction ${tx.id}`);
+          } else {
+            // For MASTERCARD: Process immediately with blockchain minting
+            await message.reply('💳 Processing your transfer...');
+            const tx = await BackendService.createTransaction(whatsappNumber, createReq);
+
+            let responseMessage = `✅ Transfer request submitted successfully!\n\n`;
+            responseMessage += `Transaction ID: ${tx.id}\n`;
+            responseMessage += `Status: ${tx.status}\n\n`;
+            responseMessage += `💰 Amount: ${data.amount} ${data.senderCurrency}\n`;
+            responseMessage += `👤 Recipient: ${data.recipientName}\n`;
+            responseMessage += `🏦 Bank: ${data.recipientBank}\n`;
+            responseMessage += `💳 Account: ${data.recipientAccount}\n\n`;
+            responseMessage += `⛓️ Blockchain processing started...\n`;
+            responseMessage += `🔔 You will receive an invoice PDF when the transaction completes.`;
+
+            await message.reply(responseMessage);
+
+            // Start polling for transaction status updates and invoice PDF
+            PollingService.startPolling(tx.id, chatId);
+            logger.info(`Started polling for MASTERCARD transaction ${tx.id}`);
           }
-
-          responseMessage += `\n\n🔔 You will receive automatic updates when the status changes.`;
-
-          await message.reply(responseMessage);
-
-          // Start polling for transaction status updates
-          PollingService.startPolling(tx.id, chatId);
-          logger.info(`Started polling for transaction ${tx.id}`);
 
         } catch (err: unknown) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -559,26 +603,35 @@ How would you like to pay?
     
     // Handle help command
     if (userInput === 'help') {
-      await message.reply(`🆘 TrustBridge Help & Support
+      await message.reply(`🆘 *TrustBridge Help & Support*
 
-📋 Available commands:
-• Type "transfer" - Start USDT→IDR transfer process
-• Type "rates" - View current USDT exchange rates
-• Type "refresh" - Force refresh exchange rates
-• Type "test" - Test CoinMarketCap API
-• Type "hi" or "hello" - Get welcome message
+📋 *Available Commands:*
+• *transfer* - Start a new cross-border transfer
+• *history* - View your transaction history
+• *status <ID>* - Check transfer status by ID
+• *rates* - View current exchange rates
+• *refresh* - Force refresh exchange rates
+• *help* - Show this help message
 
-💸 Transfer Process:
-1. Recipient name
-2. Currency selection (only IDR supported)
-3. Bank information  
-4. Account number
-5. Transfer amount (in USDT)
-6. Confirmation
+💸 *Transfer Process:*
+1. Choose payment method (WALLET or MASTERCARD)
+2. Enter recipient details (name, currency, bank, account)
+3. Select sender currency
+4. Enter transfer amount
+5. Confirm and complete payment
 
-🌐 Supported:
-• From: USDT (Tether)
-• To: IDR (Indonesian Rupiah)
+🌐 *Supported Payment Methods:*
+• *WALLET* - Pay with Cardano wallet (mockADA, mockUSDC, mockIDRX, etc.)
+• *MASTERCARD* - Pay with card (USD, EUR, IDR, etc.)
+
+🪙 *Supported Currencies:*
+• IDR (Indonesian Rupiah)
+• More coming soon!
+
+⛓️ *Blockchain Features:*
+• Real Cardano blockchain transactions
+• Instant token minting
+• Invoice PDF delivered via WhatsApp
 
 📞 Need more help? Contact our support team!`);
       return;
@@ -755,24 +808,59 @@ Next rate requests will fetch fresh data from APIs.
 
         const whatsappNumber = chatId.replace('@c.us', '');
 
-        // Ensure authenticated
-        await AuthService.ensureAuthenticated(whatsappNumber);
+        // Fetch transaction history from backend
+        const history = await BackendService.getTransactionHistory(whatsappNumber, 10);
 
-        // Note: This requires backend /api/transactions/history endpoint
-        // For now, show a placeholder message
-        await message.reply(`📋 Transaction History
+        if (history.length === 0) {
+          await message.reply(`📋 *Transaction History*
 
-This feature is coming soon! You'll be able to view:
-• All your past transactions
-• Transaction statuses
-• Payment links
-• Blockchain transaction details
+You don't have any transactions yet.
 
-Stay tuned! 🚀
+💡 Start your first transfer:
+• Type "transfer" - Start a new money transfer`);
+          return;
+        }
 
-💡 Commands:
-• "transfer" - Start a new transfer
-• "help" - See all available commands`);
+        // Format transaction history
+        let historyMessage = `📋 *Your Recent Transactions* (Last ${history.length})\n\n`;
+
+        history.forEach((tx, index) => {
+          const statusEmojiMap: Record<string, string> = {
+            'PENDING': '⏳',
+            'PAID': '💳',
+            'PROCESSING': '⚙️',
+            'COMPLETED': '✅',
+            'FAILED': '❌',
+            'CANCELLED': '🚫'
+          };
+          const statusEmoji = statusEmojiMap[tx.status] || '⏳';
+
+          const date = new Date(tx.created_at).toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit'
+          });
+
+          historyMessage += `${index + 1}. ${statusEmoji} *${tx.status}*\n`;
+          historyMessage += `   ID: ${tx.id}\n`;
+          historyMessage += `   ${tx.source_amount} ${tx.source_currency} → ${tx.target_amount.toFixed(2)} ${tx.target_currency}\n`;
+          historyMessage += `   To: ${tx.recipient_name}\n`;
+          historyMessage += `   Date: ${date}\n`;
+          historyMessage += `   Method: ${tx.payment_method}\n`;
+
+          if (tx.blockchain_tx_url) {
+            historyMessage += `   🔗 ${tx.blockchain_tx_url}\n`;
+          }
+
+          historyMessage += `\n`;
+        });
+
+        historyMessage += `💡 Commands:\n`;
+        historyMessage += `• Type "transfer" - Start new transfer\n`;
+        historyMessage += `• Type "status <ID>" - Check transfer status`;
+
+        await message.reply(historyMessage);
 
       } catch (error) {
         logger.error(`Failed to fetch history for ${chatId}:`, error);
@@ -781,6 +869,39 @@ Stay tuned! 🚀
       return;
     }
     
+    // Handle status command to check transfer by ID
+    if (userInput.startsWith('status ')) {
+      try {
+        const transferId = userInput.replace('status ', '').trim();
+
+        if (!transferId) {
+          await message.reply('❌ Please provide a transfer ID.\n\nExample: status TXN-1234567890-abc123');
+          return;
+        }
+
+        await message.reply('🔍 Checking transfer status...');
+
+        const status = await BackendService.getTransactionStatus(transferId);
+
+        let statusMessage = `📋 *Transfer Status*\n\n`;
+        statusMessage += `ID: ${status.transferId}\n`;
+        statusMessage += `Status: ${status.status}\n`;
+
+        if (status.blockchainTx) {
+          statusMessage += `\n🔗 Blockchain Transaction:\n${status.blockchainTx}`;
+        }
+
+        statusMessage += `\n\n💡 Type "history" to see all your transfers`;
+
+        await message.reply(statusMessage);
+
+      } catch (error) {
+        logger.error(`Failed to fetch status:`, error);
+        await message.reply('❌ Transfer not found or unable to fetch status. Please check the ID and try again.');
+      }
+      return;
+    }
+
     // Default response for unknown commands
     await message.reply(`🤔 I didn't understand that command.
 

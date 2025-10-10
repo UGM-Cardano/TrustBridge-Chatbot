@@ -47,6 +47,7 @@ export interface CreateTransactionRequest {
     targetCurrency: string;
     sourceAmount: number;
     recipientBankAccount?: string;
+    recipientBank?: string;
     recipientName?: string;
     paymentMethod?: 'WALLET' | 'MASTERCARD';
     card?: {

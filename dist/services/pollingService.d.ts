@@ -60,6 +60,10 @@ export declare class PollingService {
      */
     private static sendErrorMessage;
     /**
+     * Download and send invoice PDF to user
+     */
+    private static sendInvoicePDF;
+    /**
      * Get active polling tasks count
      */
     static getActiveTasksCount(): number;
