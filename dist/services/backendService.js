@@ -1,130 +1,212 @@
 import axios, { AxiosError } from 'axios';
 import logger from '../logger.js';
-import { AuthService } from './authService.js';
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
 export class BackendService {
+    static apiClient;
+    static accessTokens = new Map();
+    static userIds = new Map();
+    static initialize() {
+        const baseURL = process.env.BACKEND_API_URL || 'https://api-trustbridge.izcy.tech';
+        const timeout = parseInt(process.env.BACKEND_API_TIMEOUT || '30000', 10);
+        this.apiClient = axios.create({
+            baseURL,
+            timeout,
+            headers: {
+                'Content-Type': 'application/json',
+            },
+        });
+        logger.info(`BackendService initialized with baseURL: ${baseURL}`);
+    }
     /**
-     * Get transaction quote (exchange rate calculation)
+     * Authenticate user with backend using WhatsApp number
      */
-    static async getQuote(whatsappNumber, sourceCurrency, targetCurrency, sourceAmount) {
+    static async authenticate(whatsappNumber, countryCode = '+62') {
         try {
-            logger.info(`[BackendService] Getting quote: ${sourceAmount} ${sourceCurrency} -> ${targetCurrency}`);
-            // Get access token
-            let accessToken = AuthService.getAccessToken(whatsappNumber);
-            if (!accessToken) {
-                // Auto login if no token
-                const auth = await AuthService.loginOrRegister(whatsappNumber);
-                accessToken = auth.tokens.accessToken;
-            }
-            const response = await axios.get(`${BACKEND_URL}/api/transaction/quote`, {
-                params: {
-                    sourceCurrency,
-                    targetCurrency,
-                    sourceAmount
-                },
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`
-                },
-                timeout: 10000
+            logger.info(`Authenticating user: ${whatsappNumber}`);
+            const response = await this.apiClient.post('/api/auth/login', {
+                whatsappNumber,
+                countryCode,
             });
-            logger.info(`[BackendService] Quote received: ${JSON.stringify(response.data.quote)}`);
-            return response.data.quote;
+            if (response.data && response.data.tokens) {
+                // Store tokens for this user
+                this.accessTokens.set(whatsappNumber, response.data.tokens.accessToken);
+                this.userIds.set(whatsappNumber, response.data.user.id);
+                logger.info(`User authenticated successfully: ${whatsappNumber}`);
+            }
+            return response.data;
         }
         catch (error) {
-            const axiosError = error;
-            logger.error(`[BackendService] Get quote failed:`, axiosError.response?.data || axiosError.message);
-            throw new Error(axiosError.response?.data?.error || 'Failed to get quote');
+            this.handleError('Authentication failed', error);
+            throw error;
         }
     }
     /**
-     * Create transaction
+     * Get or create authentication for a user
+     */
+    static async ensureAuthenticated(whatsappNumber) {
+        // Check if we already have a valid token
+        const existingToken = this.accessTokens.get(whatsappNumber);
+        if (existingToken) {
+            return existingToken;
+        }
+        // Authenticate user
+        const authResponse = await this.authenticate(whatsappNumber);
+        return authResponse.tokens.accessToken;
+    }
+    /**
+     * Get access token for authenticated request
+     */
+    static async getAuthHeader(whatsappNumber) {
+        const token = await this.ensureAuthenticated(whatsappNumber);
+        return {
+            Authorization: `Bearer ${token}`,
+        };
+    }
+    /**
+     * Calculate transfer amounts before initiating transaction
+     */
+    static async calculateTransfer(senderCurrency, recipientCurrency, amount, paymentMethod) {
+        try {
+            logger.info(`Calculating transfer: ${amount} ${senderCurrency} -> ${recipientCurrency}`);
+            const response = await this.apiClient.post('/api/transfer/calculate', {
+                senderCurrency,
+                recipientCurrency,
+                amount,
+                paymentMethod,
+            });
+            if (response.data && response.data.success) {
+                return response.data.data;
+            }
+            throw new Error('Invalid response from calculate endpoint');
+        }
+        catch (error) {
+            this.handleError('Transfer calculation failed', error);
+            throw error;
+        }
+    }
+    /**
+     * Create a new transaction
      */
     static async createTransaction(whatsappNumber, request) {
         try {
-            logger.info(`[BackendService] Creating transaction for ${whatsappNumber}`);
-            // Get access token
-            let accessToken = AuthService.getAccessToken(whatsappNumber);
-            if (!accessToken) {
-                const auth = await AuthService.loginOrRegister(whatsappNumber);
-                accessToken = auth.tokens.accessToken;
-            }
-            const response = await axios.post(`${BACKEND_URL}/api/transaction/create`, request, {
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`,
-                    'Content-Type': 'application/json'
-                },
-                timeout: 15000
+            logger.info(`Creating transaction for ${whatsappNumber}:`, JSON.stringify(request, null, 2));
+            // Ensure user is authenticated
+            await this.ensureAuthenticated(whatsappNumber);
+            const authHeaders = await this.getAuthHeader(whatsappNumber);
+            // Build the payload for the backend
+            const payload = {
+                paymentMethod: request.paymentMethod || 'WALLET',
+                senderCurrency: request.sourceCurrency,
+                senderAmount: request.sourceAmount,
+                recipientName: request.recipientName,
+                recipientCurrency: request.targetCurrency,
+                recipientBank: request.recipientBankAccount, // Assuming bank name is in this field
+                recipientAccount: request.recipientBankAccount,
+                cardDetails: request.card,
+            };
+            const response = await this.apiClient.post('/api/transfer/initiate', payload, {
+                headers: authHeaders,
             });
-            logger.info(`[BackendService] Transaction created: ${response.data.transaction.id}`);
-            return response.data.transaction;
+            if (response.data && response.data.success) {
+                const transferData = response.data.data;
+                // Map backend response to Transaction format
+                const transaction = {
+                    id: transferData.id,
+                    senderId: this.userIds.get(whatsappNumber) || '',
+                    recipientPhone: request.recipientPhone,
+                    sourceCurrency: request.sourceCurrency,
+                    targetCurrency: request.targetCurrency,
+                    sourceAmount: request.sourceAmount,
+                    targetAmount: transferData.recipient?.expectedAmount || 0,
+                    exchangeRate: transferData.conversion?.exchangeRate || 0,
+                    feeAmount: transferData.fees?.amount || 0,
+                    totalAmount: transferData.sender?.totalAmount || 0,
+                    status: 'PENDING',
+                    ...(request.recipientBankAccount && { recipientBankAccount: request.recipientBankAccount }),
+                    ...(transferData.paymentLink && { paymentLink: transferData.paymentLink }),
+                    createdAt: transferData.createdAt || new Date().toISOString(),
+                };
+                logger.info(`Transaction created successfully: ${transaction.id}`);
+                return transaction;
+            }
+            throw new Error('Invalid response from initiate endpoint');
         }
         catch (error) {
-            const axiosError = error;
-            logger.error(`[BackendService] Create transaction failed:`, axiosError.response?.data || axiosError.message);
-            throw new Error(axiosError.response?.data?.error || 'Failed to create transaction');
+            this.handleError('Transaction creation failed', error);
+            throw error;
         }
     }
     /**
      * Get transaction status
      */
-    static async getTransactionStatus(whatsappNumber, transactionId) {
+    static async getTransactionStatus(transferId) {
         try {
-            logger.info(`[BackendService] Getting transaction status: ${transactionId}`);
-            let accessToken = AuthService.getAccessToken(whatsappNumber);
-            if (!accessToken) {
-                accessToken = await AuthService.refreshToken(whatsappNumber);
+            const response = await this.apiClient.get(`/api/transfer/status/${transferId}`);
+            if (response.data && response.data.success) {
+                return response.data.data;
             }
-            const response = await axios.get(`${BACKEND_URL}/api/transaction/${transactionId}`, {
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`
-                },
-                timeout: 10000
-            });
-            return response.data.transaction;
+            throw new Error('Invalid response from status endpoint');
         }
         catch (error) {
-            const axiosError = error;
-            logger.error(`[BackendService] Get transaction status failed:`, axiosError.response?.data || axiosError.message);
-            throw new Error(axiosError.response?.data?.error || 'Failed to get transaction status');
+            this.handleError('Failed to get transaction status', error);
+            throw error;
         }
     }
     /**
-     * Get transaction history
+     * Get detailed transaction information
      */
-    static async getTransactionHistory(whatsappNumber, limit = 10) {
+    static async getTransactionDetails(transferId) {
         try {
-            logger.info(`[BackendService] Getting transaction history for ${whatsappNumber}`);
-            let accessToken = AuthService.getAccessToken(whatsappNumber);
-            if (!accessToken) {
-                accessToken = await AuthService.refreshToken(whatsappNumber);
+            const response = await this.apiClient.get(`/api/transfer/details/${transferId}`);
+            if (response.data && response.data.success) {
+                return response.data.data;
             }
-            const response = await axios.get(`${BACKEND_URL}/api/transaction/history`, {
-                params: { limit },
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`
-                },
-                timeout: 10000
-            });
-            return response.data.transactions;
+            throw new Error('Invalid response from details endpoint');
         }
         catch (error) {
-            const axiosError = error;
-            logger.error(`[BackendService] Get history failed:`, axiosError.response?.data || axiosError.message);
-            throw new Error(axiosError.response?.data?.error || 'Failed to get transaction history');
+            this.handleError('Failed to get transaction details', error);
+            throw error;
         }
     }
     /**
-     * Check if backend is healthy
+     * Handle API errors with proper logging
      */
-    static async healthCheck() {
-        try {
-            const response = await axios.get(`${BACKEND_URL}/`, { timeout: 5000 });
-            return response.status === 200;
+    static handleError(message, error) {
+        if (axios.isAxiosError(error)) {
+            const axiosError = error;
+            const status = axiosError.response?.status;
+            const data = axiosError.response?.data;
+            logger.error(`${message}:`, {
+                status,
+                data,
+                message: axiosError.message,
+            });
+            // Handle specific error cases
+            if (status === 401) {
+                // Clear stored tokens on authentication failure
+                this.accessTokens.clear();
+                this.userIds.clear();
+            }
         }
-        catch (error) {
-            logger.error('[BackendService] Health check failed:', error);
-            return false;
+        else {
+            logger.error(`${message}:`, error);
+        }
+    }
+    /**
+     * Clear authentication cache (for testing or logout)
+     */
+    static clearAuth(whatsappNumber) {
+        if (whatsappNumber) {
+            this.accessTokens.delete(whatsappNumber);
+            this.userIds.delete(whatsappNumber);
+            logger.info(`Cleared auth cache for ${whatsappNumber}`);
+        }
+        else {
+            this.accessTokens.clear();
+            this.userIds.clear();
+            logger.info('Cleared all auth cache');
         }
     }
 }
+// Initialize on module load
+BackendService.initialize();
 //# sourceMappingURL=backendService.js.map

@@ -4,6 +4,9 @@ import qrcode from 'qrcode-terminal';
 import logger from './logger.js';
 import { getExchangeRate, calculateRecipientAmount, getCurrentRates, testCMCConnection, FALLBACK_RATES, getCacheStats, clearExchangeRateCache, forceRefreshRates } from './exchangeRate.js';
 import { SUPPORTED_FIAT } from './fiatExchange.js';
+import { BackendService } from './services/backendService.js';
+import { AuthService } from './services/authService.js';
+import { PollingService } from './services/pollingService.js';
 const { Client, LocalAuth } = pkg;
 const client = new Client({
     authStrategy: new LocalAuth({
@@ -325,10 +328,14 @@ Type "confirm" to proceed, "cancel" to abort, or "back" to change amount.`;
                 // Clear transfer flow
                 delete userState.transferFlow;
                 try {
-                    const backend = await import('./services/backendService.js');
-                    // Build request without assigning undefined fields (to satisfy strict optional types)
+                    // Extract WhatsApp number from chatId (format: 1234567890@c.us)
+                    const whatsappNumber = chatId.replace('@c.us', '');
+                    // Ensure user is authenticated with backend
+                    await message.reply('🔐 Authenticating with backend...');
+                    await AuthService.ensureAuthenticated(whatsappNumber);
+                    // Build request
                     const createReq = {
-                        recipientPhone: chatId.startsWith('+') ? chatId : `+${chatId.replace('@c.us', '')}`,
+                        recipientPhone: chatId.startsWith('+') ? chatId : `+${whatsappNumber}`,
                         sourceCurrency: data.senderCurrency,
                         targetCurrency: data.recipientCurrency,
                         sourceAmount: parseFloat(data.amount)
@@ -337,7 +344,7 @@ Type "confirm" to proceed, "cancel" to abort, or "back" to change amount.`;
                         createReq.recipientBankAccount = data.recipientAccount;
                     if (data.recipientName)
                         createReq.recipientName = data.recipientName;
-                    // Attach payment method and card data when paying by Mastercard
+                    // Attach payment method and card data
                     if (data.paymentMethod === 'MASTERCARD') {
                         createReq.paymentMethod = 'MASTERCARD';
                         createReq.card = {
@@ -349,13 +356,25 @@ Type "confirm" to proceed, "cancel" to abort, or "back" to change amount.`;
                     else {
                         createReq.paymentMethod = 'WALLET';
                     }
-                    const tx = await backend.BackendService.createTransaction(chatId, createReq);
-                    await message.reply(`✅ Transfer request submitted successfully!\n\nTransaction ID: ${tx.id}\nStatus: ${tx.status}\nPayment link: ${tx.paymentLink || 'N/A'}\n\nYou will receive updates when the status changes.`);
+                    await message.reply('💳 Creating transaction...');
+                    const tx = await BackendService.createTransaction(whatsappNumber, createReq);
+                    let responseMessage = `✅ Transfer request submitted successfully!\n\n`;
+                    responseMessage += `Transaction ID: ${tx.id}\n`;
+                    responseMessage += `Status: ${tx.status}\n`;
+                    if (tx.paymentLink) {
+                        responseMessage += `\n💳 Payment Link:\n${tx.paymentLink}\n`;
+                        responseMessage += `\nPlease complete your payment using the link above.`;
+                    }
+                    responseMessage += `\n\n🔔 You will receive automatic updates when the status changes.`;
+                    await message.reply(responseMessage);
+                    // Start polling for transaction status updates
+                    PollingService.startPolling(tx.id, chatId);
+                    logger.info(`Started polling for transaction ${tx.id}`);
                 }
                 catch (err) {
                     const msg = err instanceof Error ? err.message : String(err);
                     logger.error('[Transfer] Create transaction error:', msg);
-                    await message.reply(`❌ Failed to create transaction: ${msg || 'Unknown error'}. Please try again later.`);
+                    await message.reply(`❌ Failed to create transaction: ${msg || 'Unknown error'}.\n\nPlease try again later or contact support.`);
                 }
                 return true;
             }
@@ -605,6 +624,35 @@ Next rate requests will fetch fresh data from APIs.
 💡 Type "rates" to fetch new rates`);
         return;
     }
+    // Handle transaction history command
+    if (userInput === 'history') {
+        try {
+            await message.reply('📜 Fetching your transaction history...');
+            const whatsappNumber = chatId.replace('@c.us', '');
+            // Ensure authenticated
+            await AuthService.ensureAuthenticated(whatsappNumber);
+            // Note: This requires backend /api/transactions/history endpoint
+            // For now, show a placeholder message
+            await message.reply(`📋 Transaction History
+
+This feature is coming soon! You'll be able to view:
+• All your past transactions
+• Transaction statuses
+• Payment links
+• Blockchain transaction details
+
+Stay tuned! 🚀
+
+💡 Commands:
+• "transfer" - Start a new transfer
+• "help" - See all available commands`);
+        }
+        catch (error) {
+            logger.error(`Failed to fetch history for ${chatId}:`, error);
+            await message.reply('❌ Unable to fetch transaction history. Please try again later.');
+        }
+        return;
+    }
     // Default response for unknown commands
     await message.reply(`🤔 I didn't understand that command.
 
@@ -625,6 +673,11 @@ client.on('auth_failure', (message) => {
 // Initialize client
 logger.info('Initializing WhatsApp bot...');
 client.initialize();
+// Initialize PollingService with client
+client.on('ready', () => {
+    logger.info('WhatsApp client ready');
+    PollingService.initialize(client);
+});
 // Show QR in terminal when needed
 client.on('qr', (qr) => {
     try {
@@ -633,5 +686,16 @@ client.on('qr', (qr) => {
     catch (e) {
         logger.debug('QR generation failed:', e);
     }
+});
+// Cleanup on exit
+process.on('SIGINT', () => {
+    logger.info('Shutting down gracefully...');
+    PollingService.stopAll();
+    process.exit(0);
+});
+process.on('SIGTERM', () => {
+    logger.info('Shutting down gracefully...');
+    PollingService.stopAll();
+    process.exit(0);
 });
 //# sourceMappingURL=index.js.map

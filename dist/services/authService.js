@@ -1,131 +1,149 @@
-import axios, { AxiosError } from 'axios';
 import logger from '../logger.js';
-const BACKEND_URL = process.env.BACKEND_URL || 'http://localhost:3000';
+import { BackendService } from './backendService.js';
 export class AuthService {
-    static tokenCache = new Map();
+    static sessions = new Map();
+    static TOKEN_EXPIRY_BUFFER = 5 * 60 * 1000; // 5 minutes buffer
     /**
-     * Login or register user via WhatsApp number
+     * Login or register a user via WhatsApp number
      */
-    static async loginOrRegister(whatsappNumber, countryCode = 'ID') {
+    static async loginOrRegister(whatsappNumber, countryCode = '+62') {
         try {
-            logger.info(`[AuthService] Logging in user: ${whatsappNumber}`);
-            const response = await axios.post(`${BACKEND_URL}/api/auth/login`, {
-                whatsappNumber,
-                countryCode
-            }, {
-                timeout: 10000
-            });
-            const { user, tokens } = response.data;
-            // Cache token (expires in 1 hour)
-            this.tokenCache.set(whatsappNumber, {
-                accessToken: tokens.accessToken,
-                refreshToken: tokens.refreshToken,
-                expiresAt: Date.now() + 60 * 60 * 1000 // 1 hour
-            });
-            logger.info(`[AuthService] Login successful for ${whatsappNumber}`);
-            return response.data;
+            logger.info(`AuthService: Login/Register for ${whatsappNumber}`);
+            // Check if user already has a valid session
+            const existingSession = this.sessions.get(whatsappNumber);
+            if (existingSession && this.isSessionValid(existingSession)) {
+                logger.info(`Using existing session for ${whatsappNumber}`);
+                return existingSession.user;
+            }
+            // Authenticate with backend
+            const authResponse = await BackendService.authenticate(whatsappNumber, countryCode);
+            // Store session
+            const session = {
+                user: authResponse.user,
+                accessToken: authResponse.tokens.accessToken,
+                refreshToken: authResponse.tokens.refreshToken,
+                expiresAt: Date.now() + 3600000, // 1 hour from now (adjust based on your JWT expiry)
+            };
+            this.sessions.set(whatsappNumber, session);
+            logger.info(`Session created for ${whatsappNumber}, user ID: ${authResponse.user.id}`);
+            return authResponse.user;
         }
         catch (error) {
-            const axiosError = error;
-            logger.error(`[AuthService] Login failed for ${whatsappNumber}:`, axiosError.response?.data || axiosError.message);
-            throw new Error(axiosError.response?.data?.error || 'Login failed');
+            logger.error(`AuthService: Login failed for ${whatsappNumber}:`, error);
+            throw new Error(`Authentication failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
     /**
-     * Get cached access token for user
+     * Get current user session
      */
-    static getAccessToken(whatsappNumber) {
-        const cached = this.tokenCache.get(whatsappNumber);
-        if (!cached) {
+    static getSession(whatsappNumber) {
+        const session = this.sessions.get(whatsappNumber);
+        if (!session) {
             return null;
         }
-        // Check if token expired
-        if (Date.now() > cached.expiresAt) {
-            this.tokenCache.delete(whatsappNumber);
+        if (!this.isSessionValid(session)) {
+            // Session expired, remove it
+            this.sessions.delete(whatsappNumber);
             return null;
         }
-        return cached.accessToken;
+        return session;
     }
     /**
-     * Refresh access token
+     * Get user info from session
      */
-    static async refreshToken(whatsappNumber) {
+    static getUser(whatsappNumber) {
+        const session = this.getSession(whatsappNumber);
+        return session ? session.user : null;
+    }
+    /**
+     * Get access token for a user
+     */
+    static async getAccessToken(whatsappNumber) {
+        const session = this.getSession(whatsappNumber);
+        if (!session) {
+            return null;
+        }
+        // Check if token is about to expire
+        if (this.isTokenExpiringSoon(session)) {
+            logger.info(`Token expiring soon for ${whatsappNumber}, refreshing...`);
+            await this.refreshSession(whatsappNumber);
+            const refreshedSession = this.sessions.get(whatsappNumber);
+            return refreshedSession ? refreshedSession.accessToken : null;
+        }
+        return session.accessToken;
+    }
+    /**
+     * Check if session is valid
+     */
+    static isSessionValid(session) {
+        return Date.now() < session.expiresAt;
+    }
+    /**
+     * Check if token is expiring soon (within buffer time)
+     */
+    static isTokenExpiringSoon(session) {
+        return Date.now() >= (session.expiresAt - this.TOKEN_EXPIRY_BUFFER);
+    }
+    /**
+     * Refresh user session (token refresh logic)
+     * Note: This requires /api/auth/refresh endpoint on backend
+     */
+    static async refreshSession(whatsappNumber) {
         try {
-            const cached = this.tokenCache.get(whatsappNumber);
-            if (!cached || !cached.refreshToken) {
-                throw new Error('No refresh token available');
+            const session = this.sessions.get(whatsappNumber);
+            if (!session) {
+                throw new Error('No session to refresh');
             }
-            logger.info(`[AuthService] Refreshing token for ${whatsappNumber}`);
-            const response = await axios.post(`${BACKEND_URL}/api/auth/refresh`, {
-                refreshToken: cached.refreshToken
-            });
-            const { accessToken, refreshToken } = response.data.tokens;
-            // Update cache
-            this.tokenCache.set(whatsappNumber, {
-                accessToken,
-                refreshToken,
-                expiresAt: Date.now() + 60 * 60 * 1000
-            });
-            return accessToken;
+            // For now, just re-authenticate
+            // In production, you'd call /api/auth/refresh with refreshToken
+            logger.info(`Re-authenticating ${whatsappNumber} to refresh session`);
+            await this.loginOrRegister(whatsappNumber);
         }
         catch (error) {
-            const axiosError = error;
-            logger.error(`[AuthService] Token refresh failed:`, axiosError.response?.data || axiosError.message);
-            this.tokenCache.delete(whatsappNumber);
-            throw new Error('Token refresh failed');
+            logger.error(`Failed to refresh session for ${whatsappNumber}:`, error);
+            // Clear invalid session
+            this.sessions.delete(whatsappNumber);
+            throw error;
         }
     }
     /**
-     * Get user info from backend
+     * Ensure user is authenticated, login if not
      */
-    static async getCurrentUser(whatsappNumber) {
-        try {
-            let accessToken = this.getAccessToken(whatsappNumber);
-            // Refresh if expired
-            if (!accessToken) {
-                accessToken = await this.refreshToken(whatsappNumber);
-            }
-            const response = await axios.get(`${BACKEND_URL}/api/auth/me`, {
-                headers: {
-                    'Authorization': `Bearer ${accessToken}`
-                }
-            });
-            return response.data.user;
+    static async ensureAuthenticated(whatsappNumber) {
+        const user = this.getUser(whatsappNumber);
+        if (user) {
+            return user;
         }
-        catch (error) {
-            const axiosError = error;
-            logger.error(`[AuthService] Get user failed:`, axiosError.response?.data || axiosError.message);
-            throw new Error('Failed to get user info');
-        }
+        // Not authenticated, login
+        return await this.loginOrRegister(whatsappNumber);
     }
     /**
-     * Logout user
+     * Logout user (clear session)
      */
-    static async logout(whatsappNumber) {
-        try {
-            const accessToken = this.getAccessToken(whatsappNumber);
-            if (accessToken) {
-                await axios.post(`${BACKEND_URL}/api/auth/logout`, {}, {
-                    headers: {
-                        'Authorization': `Bearer ${accessToken}`
-                    }
-                });
-            }
-            this.tokenCache.delete(whatsappNumber);
-            logger.info(`[AuthService] Logout successful for ${whatsappNumber}`);
-        }
-        catch (error) {
-            const axiosError = error;
-            logger.error(`[AuthService] Logout failed:`, axiosError.response?.data || axiosError.message);
-            this.tokenCache.delete(whatsappNumber);
-        }
+    static logout(whatsappNumber) {
+        this.sessions.delete(whatsappNumber);
+        BackendService.clearAuth(whatsappNumber);
+        logger.info(`User ${whatsappNumber} logged out`);
     }
     /**
-     * Clear all cached tokens
+     * Clear all sessions (for admin/testing purposes)
      */
-    static clearCache() {
-        this.tokenCache.clear();
-        logger.info('[AuthService] Token cache cleared');
+    static clearAllSessions() {
+        this.sessions.clear();
+        BackendService.clearAuth();
+        logger.info('All user sessions cleared');
+    }
+    /**
+     * Get session count (for monitoring)
+     */
+    static getSessionCount() {
+        return this.sessions.size;
+    }
+    /**
+     * Get all active sessions (for monitoring)
+     */
+    static getActiveSessions() {
+        return Array.from(this.sessions.keys());
     }
 }
 //# sourceMappingURL=authService.js.map
